@@ -1,13 +1,20 @@
 import SwiftUI
 import AppKit
+import Metal
+import MetalKit
 
 struct ContentView: View {
     @State private var apps: [AppItem] = []
     @State private var keyword: String = ""
     @State private var debouncedKeyword: String = ""
     @State private var currentPage: Int = 0
+    @State private var performanceStats: (scanTime: TimeInterval, appCount: Int, gpuUsed: Bool) = (0, 0, false)
+    
+    // GPU 渲染器 & 搜索引擎
+    @StateObject private var metalRenderer = MetalRenderer()
+    @StateObject private var gpuSearchEngine = GPUSearchEngine()
 
-    // 图标与单元尺寸（用于自适应计算）
+    // 图标与布局参数
     private let iconSize: CGFloat = 72
     private let tileHPad: CGFloat = 6
     private let tileVPad: CGFloat = 6
@@ -19,162 +26,397 @@ struct ContentView: View {
     // 过滤后的应用列表
     var filteredApps: [AppItem] {
         let k = debouncedKeyword.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if k.isEmpty {
-            return apps
-        }
-        return apps.filter { item in
-            item.name.lowercased().contains(k) || item.bundleID.lowercased().contains(k)
+        if k.isEmpty { return apps }
+        
+        if apps.count > 100 && metalRenderer.isGPUAvailable {
+            return gpuSearchEngine.searchApps(apps, query: k)
+        } else {
+            return apps.filter { item in
+                item.name.lowercased().contains(k) || item.bundleID.lowercased().contains(k)
+            }
         }
     }
 
-    // 分页数据在 GeometryReader 中按窗口尺寸动态计算
-
     var body: some View {
         ZStack {
-            SolidBackground()      // 纯色背景（定义于 UIHelpers.swift）
-            WindowConfigurator()   // 窗口配置（定义于 UIHelpers.swift）
+            // 背景：GPU 或 CPU
+            if metalRenderer.isGPUAvailable {
+                MetalBackgroundView(renderer: metalRenderer)
+                    .ignoresSafeArea()
+            } else {
+                SolidBackground()
+            }
+            
+            WindowConfigurator()
 
             VStack(spacing: 16) {
-                // 顶部搜索条
-                ZStack {
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(Color.white.opacity(0.12))
-                        .overlay(
+                // 顶部搜索栏 + GPU 状态
+                VStack(spacing: 8) {
+                    HStack {
+                        ZStack {
                             RoundedRectangle(cornerRadius: 16)
-                                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                        )
-                        .frame(height: 56)
+                                .fill(Color.white.opacity(0.12))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 16)
+                                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                                )
+                                .frame(height: 56)
 
-                    HStack(spacing: 12) {
-                        TextField("Search apps…", text: $keyword)
-                            .textFieldStyle(.plain)
-                            .disableAutocorrection(true)
-                            .padding(.leading, 12)
-                            .padding(.trailing, 12)
+                            HStack(spacing: 12) {
+                                TextField("Search apps…", text: $keyword)
+                                    .textFieldStyle(.plain)
+                                    .disableAutocorrection(true)
+                                    .padding(.leading, 12)
+                                    .padding(.trailing, 12)
 
-                        Button("Rescan") {
-                            apps = AppScanner.scanAllApps()
+                                Button("Rescan") { rescanApps() }
+                                    .buttonStyle(.bordered)
+                            }
+                            .padding(.horizontal, 12)
                         }
-                        .buttonStyle(.bordered)
+                        
+                        GPUStatusIndicator(
+                            isGPUUsed: performanceStats.gpuUsed,
+                            scanTime: performanceStats.scanTime,
+                            appCount: performanceStats.appCount
+                        )
                     }
-                    .padding(.horizontal, 12)
+                    
+                    #if DEBUG
+                    PerformanceStatsView(stats: performanceStats, filteredCount: filteredApps.count)
+                    #endif
                 }
                 .padding(.top, 40)
 
-                // 横向分页网格 + 页码指示（自适应列/行）
+                // 分页网格
                 VStack(spacing: 12) {
                     GeometryReader { proxy in
-                        // 可用宽高（去除左右内边距）
-                        let availW = max(0, proxy.size.width - horizontalPadding * 2)
-                        // 为圆点等留出空间 40
-                        let availH = max(0, proxy.size.height - 40)
-                        // 单元最小宽高（图标 + 文本 + 内边距）
-                        let minTileW = iconSize + tileHPad * 2
-                        let minTileH = iconSize + tileVPad * 2 + tileSpacingV + titleHeight
-                        // 计算列数与行数（最多 7 列 × 5 行）
-                        let cols = min(7, max(1, Int((availW + gridSpacing) / (minTileW + gridSpacing))))
-                        let rows = min(5, max(1, Int((availH + gridSpacing) / (minTileH + gridSpacing))))
-                        let pageSize = cols * rows
-
-                        // 根据自适应 pageSize 对 filteredApps 分页
-                        let pages: [[AppItem]] = stride(from: 0, to: filteredApps.count, by: max(pageSize,1)).map {
-                            let end = min($0 + max(pageSize,1), filteredApps.count)
-                            return Array(filteredApps[$0..<end])
-                        }
-
-                        // 网格列配置（自适应列数）
-                        let columns = Array(repeating: GridItem(.flexible(), spacing: gridSpacing, alignment: .top), count: max(cols,1))
-
-                        VStack(spacing: 12) {
-                            TabView(selection: $currentPage) {
-                                ForEach(pages.indices, id: \.self) { index in
-                                    let page = pages[index]
-                                    LazyVGrid(columns: columns, spacing: gridSpacing) {
-                                        ForEach(page) { app in
-                                            AppIconTile(app: app)
-                                        }
-                                        // 占位，避免最后一页对不齐
-                                        if page.count < pageSize {
-                                            ForEach(0..<(pageSize - page.count), id: \.self) { _ in
-                                                Color.clear.frame(height: minTileH)
-                                            }
-                                        }
-                                    }
-                                    .padding(.horizontal, horizontalPadding)
-                                    .padding(.bottom, 8)
-                                    .tag(index)
-                                }
-                            }
-#if os(macOS)
-                            .tabViewStyle(DefaultTabViewStyle())
-                            // 捕获两指左右轻扫（macOS）
-                            .background(
-                                SwipeCatcher(
-                                    onLeft: { withAnimation(.easeInOut(duration: 0.22)) { currentPage = min(currentPage + 1, max(pages.count - 1, 0)) } },
-                                    onRight: { withAnimation(.easeInOut(duration: 0.22)) { currentPage = max(currentPage - 1, 0) } }
-                                ).ignoresSafeArea()
-                            )
-                            // 鼠标/触控拖拽切页（备用）
-                            .contentShape(Rectangle())
-                            .highPriorityGesture(
-                                DragGesture(minimumDistance: 15)
-                                    .onEnded { value in
-                                        let dx = value.translation.width
-                                        let dy = value.translation.height
-                                        guard abs(dx) > 40, abs(dx) > abs(dy) else { return }
-                                        if dx < 0 {
-                                            withAnimation(.easeInOut(duration: 0.22)) {
-                                                currentPage = min(currentPage + 1, max(pages.count - 1, 0))
-                                            }
-                                        } else {
-                                            withAnimation(.easeInOut(duration: 0.22)) {
-                                                currentPage = max(currentPage - 1, 0)
-                                            }
-                                        }
-                                    }
-                            )
-#else
-                            .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
-#endif
-                            // 页码指示器
-                            HStack(spacing: 6) {
-                                ForEach(0..<(max(pages.count, 1)), id: \.self) { i in
-                                    Circle()
-                                        .fill(i == min(currentPage, max(pages.count - 1, 0)) ? Color.primary.opacity(0.8) : Color.primary.opacity(0.25))
-                                        .frame(width: 6, height: 6)
-                                }
-                            }
-                            .padding(.bottom, 24)
-                        }
+                        GPUOptimizedGridView(
+                            apps: filteredApps,
+                            currentPage: $currentPage,
+                            iconSize: iconSize,
+                            tileHPad: tileHPad,
+                            tileVPad: tileVPad,
+                            titleHeight: titleHeight,
+                            tileSpacingV: tileSpacingV,
+                            gridSpacing: gridSpacing,
+                            horizontalPadding: horizontalPadding,
+                            availableSize: proxy.size,
+                            metalRenderer: metalRenderer
+                        )
                     }
                     .animation(.easeInOut(duration: 0.18), value: filteredApps)
                 }
             }
             .ignoresSafeArea()
         }
-        .onAppear {
-            apps = AppScanner.scanAllApps()
-            IconProvider.preheat(apps: apps, size: 72)
-            debouncedKeyword = keyword
-        }
-        .onChange(of: keyword) { newValue in
-            let latest = newValue
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                if latest == keyword {
-                    debouncedKeyword = latest
+        .onAppear { initializeApp() }
+        .onChange(of: keyword) { newValue in debounceSearch(newValue) }
+        .onChange(of: apps) { newApps in updateIconCache(newApps) }
+        .onChange(of: filteredApps) { _ in currentPage = 0 }
+    }
+    
+    // MARK: - 初始化 & 扫描
+    private func initializeApp() {
+        metalRenderer.initialize()
+        gpuSearchEngine.initialize()
+        rescanApps()
+    }
+    
+    private func rescanApps() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let scannedApps = AppScanner.scanAllApps()
+            let stats = AppScanner.getPerformanceStats()
+            
+            DispatchQueue.main.async {
+                apps = scannedApps
+                performanceStats = stats
+                if metalRenderer.isGPUAvailable {
+                    metalRenderer.preheatIconCache(for: scannedApps)
                 }
             }
         }
-        .onChange(of: apps) { newApps in
-            IconProvider.preheat(apps: newApps, size: 72)
+    }
+    
+    private func debounceSearch(_ newValue: String) {
+        let latest = newValue
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            if latest == keyword {
+                debouncedKeyword = latest
+            }
         }
-        .onChange(of: filteredApps) { _ in
-            currentPage = 0
+    }
+    
+    private func updateIconCache(_ newApps: [AppItem]) {
+        if metalRenderer.isGPUAvailable {
+            metalRenderer.preheatIconCache(for: newApps)
+        } else {
+            IconProvider.preheat(apps: newApps, size: 72)
         }
     }
 }
 
-// 自定义 ButtonStyle：按下时缩放，类似 Launchpad 点击反馈
+// MARK: - GPU 优化网格
+struct GPUOptimizedGridView: View {
+    let apps: [AppItem]
+    @Binding var currentPage: Int
+    let iconSize: CGFloat
+    let tileHPad: CGFloat
+    let tileVPad: CGFloat
+    let titleHeight: CGFloat
+    let tileSpacingV: CGFloat
+    let gridSpacing: CGFloat
+    let horizontalPadding: CGFloat
+    let availableSize: CGSize
+    let metalRenderer: MetalRenderer
+    
+    var body: some View {
+        let layout = calculateGridLayout()
+        let pages = createPages(pageSize: layout.pageSize)
+        
+        VStack(spacing: 12) {
+            TabView(selection: $currentPage) {
+                ForEach(pages.indices, id: \.self) { index in
+                    let page = pages[index]
+                    
+                    if metalRenderer.isGPUAvailable {
+                        GPUAcceleratedGridPage(
+                            apps: page,
+                            columns: layout.columns,
+                            gridSpacing: gridSpacing,
+                            horizontalPadding: horizontalPadding,
+                            pageSize: layout.pageSize,
+                            metalRenderer: metalRenderer
+                        )
+                    } else {
+                        CPUFallbackGridPage(
+                            apps: page,
+                            columns: layout.columns,
+                            gridSpacing: gridSpacing,
+                            horizontalPadding: horizontalPadding,
+                            pageSize: layout.pageSize
+                        )
+                    }
+                }
+            }
+#if os(macOS)
+            .tabViewStyle(DefaultTabViewStyle())
+            .background(
+                SwipeCatcher(
+                    onLeft: { nextPage(maxPage: max(pages.count - 1, 0)) },
+                    onRight: { previousPage() }
+                ).ignoresSafeArea()
+            )
+            .contentShape(Rectangle())
+            .highPriorityGesture(createDragGesture(maxPage: max(pages.count - 1, 0)))
+#else
+            .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
+#endif
+            
+            PageIndicator(currentPage: currentPage, totalPages: max(pages.count, 1))
+                .padding(.bottom, 24)
+        }
+    }
+    
+    private func calculateGridLayout() -> (columns: [GridItem], pageSize: Int) {
+        let availW = max(0, availableSize.width - horizontalPadding * 2)
+        let availH = max(0, availableSize.height - 40)
+        let minTileW = iconSize + tileHPad * 2
+        let minTileH = iconSize + tileVPad * 2 + tileSpacingV + titleHeight
+        
+        let cols = min(7, max(1, Int((availW + gridSpacing) / (minTileW + gridSpacing))))
+        let rows = min(5, max(1, Int((availH + gridSpacing) / (minTileH + gridSpacing))))
+        let pageSize = cols * rows
+        
+        let columns = Array(repeating: GridItem(.flexible(), spacing: gridSpacing, alignment: .top), count: max(cols, 1))
+        return (columns, pageSize)
+    }
+    
+    private func createPages(pageSize: Int) -> [[AppItem]] {
+        stride(from: 0, to: apps.count, by: max(pageSize, 1)).map {
+            let end = min($0 + max(pageSize, 1), apps.count)
+            return Array(apps[$0..<end])
+        }
+    }
+    
+    private func nextPage(maxPage: Int) {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            currentPage = min(currentPage + 1, maxPage)
+        }
+    }
+    
+    private func previousPage() {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            currentPage = max(currentPage - 1, 0)
+        }
+    }
+    
+    private func createDragGesture(maxPage: Int) -> some Gesture {
+        DragGesture(minimumDistance: 15)
+            .onEnded { value in
+                let dx = value.translation.width
+                let dy = value.translation.height
+                guard abs(dx) > 40, abs(dx) > abs(dy) else { return }
+                if dx < 0 { nextPage(maxPage: maxPage) }
+                else { previousPage() }
+            }
+    }
+}
+
+// MARK: - GPU/CPU 网格页
+struct GPUAcceleratedGridPage: View {
+    let apps: [AppItem]
+    let columns: [GridItem]
+    let gridSpacing: CGFloat
+    let horizontalPadding: CGFloat
+    let pageSize: Int
+    let metalRenderer: MetalRenderer
+    
+    var body: some View {
+        LazyVGrid(columns: columns, spacing: gridSpacing) {
+            ForEach(apps) { app in
+                GPUAcceleratedAppTile(app: app, metalRenderer: metalRenderer)
+            }
+            if apps.count < pageSize {
+                ForEach(0..<(pageSize - apps.count), id: \.self) { _ in
+                    Color.clear.frame(height: 94)
+                }
+            }
+        }
+        .padding(.horizontal, horizontalPadding)
+        .padding(.bottom, 8)
+    }
+}
+
+struct CPUFallbackGridPage: View {
+    let apps: [AppItem]
+    let columns: [GridItem]
+    let gridSpacing: CGFloat
+    let horizontalPadding: CGFloat
+    let pageSize: Int
+    
+    var body: some View {
+        LazyVGrid(columns: columns, spacing: gridSpacing) {
+            ForEach(apps) { app in
+                AppIconTile(app: app)
+            }
+            if apps.count < pageSize {
+                ForEach(0..<(pageSize - apps.count), id: \.self) { _ in
+                    Color.clear.frame(height: 94)
+                }
+            }
+        }
+        .padding(.horizontal, horizontalPadding)
+        .padding(.bottom, 8)
+    }
+}
+
+// MARK: - GPU 图标瓦片
+struct GPUAcceleratedAppTile: View {
+    let app: AppItem
+    let metalRenderer: MetalRenderer
+    @State private var flashOpacity: Double = 0.0
+    @State private var isHovered: Bool = false
+    
+    var body: some View {
+        Button(action: {
+            triggerClickEffect()
+            launchApp()
+        }) {
+            VStack(spacing: 8) {
+                MetalIconView(
+                    app: app,
+                    size: 72,
+                    renderer: metalRenderer,
+                    flashOpacity: flashOpacity,
+                    isHovered: isHovered
+                )
+                Text(app.name)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .frame(height: 14, alignment: .center)
+                    .foregroundColor(.primary)
+            }
+            .padding(6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(LaunchpadButtonStyle())
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.15)) { isHovered = hovering }
+        }
+        .contextMenu {
+            Button("Open") { launchApp() }
+            Button("Show in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: app.path)])
+            }
+            Button("Copy Bundle ID") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(app.bundleID, forType: .string)
+            }
+        }
+    }
+    
+    private func triggerClickEffect() {
+        withAnimation(.easeOut(duration: 0.08)) { flashOpacity = 0.18 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+            withAnimation(.easeOut(duration: 0.16)) { flashOpacity = 0.0 }
+        }
+    }
+    
+    private func launchApp() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: app.path))
+        }
+    }
+}
+
+// MARK: - 其它组件
+struct GPUStatusIndicator: View {
+    let isGPUUsed: Bool
+    let scanTime: TimeInterval
+    let appCount: Int
+    
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle().fill(isGPUUsed ? Color.green : Color.orange)
+                .frame(width: 8, height: 8)
+            Text(isGPUUsed ? "GPU" : "CPU")
+                .font(.caption2).opacity(0.7)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(Color.black.opacity(0.15)).cornerRadius(8)
+    }
+}
+
+struct PerformanceStatsView: View {
+    let stats: (scanTime: TimeInterval, appCount: Int, gpuUsed: Bool)
+    let filteredCount: Int
+    
+    var body: some View {
+        HStack {
+            Text("📊 \(stats.appCount) apps | \(String(format: "%.3f", stats.scanTime))s | Showing: \(filteredCount)")
+                .font(.caption2).opacity(0.6)
+            Spacer()
+        }
+    }
+}
+
+struct PageIndicator: View {
+    let currentPage: Int
+    let totalPages: Int
+    
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(0..<totalPages, id: \.self) { i in
+                Circle()
+                    .fill(i == min(currentPage, max(totalPages - 1, 0)) ?
+                          Color.primary.opacity(0.8) : Color.primary.opacity(0.25))
+                    .frame(width: 6, height: 6)
+            }
+        }
+    }
+}
+
 struct LaunchpadButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -183,7 +425,6 @@ struct LaunchpadButtonStyle: ButtonStyle {
     }
 }
 
-// 应用图标单元，带点击缩放与闪光效果
 struct AppIconTile: View {
     let app: AppItem
     @State private var flashOpacity: Double = 0.0
@@ -220,8 +461,7 @@ struct AppIconTile: View {
                     .frame(height: 14, alignment: .center)
                     .foregroundColor(.primary)
             }
-            .padding(6)
-            .contentShape(Rectangle())
+            .padding(6).contentShape(Rectangle())
         }
         .buttonStyle(LaunchpadButtonStyle())
         .contextMenu {
