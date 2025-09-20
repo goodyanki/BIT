@@ -7,13 +7,14 @@ struct ContentView: View {
     @State private var debouncedKeyword: String = ""
     @State private var currentPage: Int = 0
 
-    // 布局：固定 7 列 × 5 行，类似 Launchpad
-    private let columnsCount = 7
-    private let rowsCount = 5
-    private var pageSize: Int { columnsCount * rowsCount }
-    private var gridColumns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 16, alignment: .top), count: columnsCount)
-    }
+    // 图标与单元尺寸（用于自适应计算）
+    private let iconSize: CGFloat = 72
+    private let tileHPad: CGFloat = 6
+    private let tileVPad: CGFloat = 6
+    private let titleHeight: CGFloat = 14
+    private let tileSpacingV: CGFloat = 8
+    private let gridSpacing: CGFloat = 16
+    private let horizontalPadding: CGFloat = 40
 
     // 过滤后的应用列表
     var filteredApps: [AppItem] {
@@ -22,32 +23,19 @@ struct ContentView: View {
             return apps
         }
         return apps.filter { item in
-            let n1 = item.name.lowercased().contains(k)
-            let n2 = item.bundleID.lowercased().contains(k)
-            return n1 || n2
+            item.name.lowercased().contains(k) || item.bundleID.lowercased().contains(k)
         }
     }
 
-    // 分页后的数据
-    var pages: [[AppItem]] {
-        guard pageSize > 0 else { return [] }
-        var result: [[AppItem]] = []
-        var i = 0
-        while i < filteredApps.count {
-            let end = min(i + pageSize, filteredApps.count)
-            result.append(Array(filteredApps[i..<end]))
-            i = end
-        }
-        return result
-    }
+    // 分页数据在 GeometryReader 中按窗口尺寸动态计算
 
     var body: some View {
         ZStack {
-            SolidBackground()      // 纯色背景
-            WindowConfigurator()   // 全屏 + 透明窗口
+            SolidBackground()      // 纯色背景（定义于 UIHelpers.swift）
+            WindowConfigurator()   // 窗口配置（定义于 UIHelpers.swift）
 
             VStack(spacing: 16) {
-                // 顶部毛玻璃搜索条
+                // 顶部搜索条
                 ZStack {
                     RoundedRectangle(cornerRadius: 16)
                         .fill(Color.white.opacity(0.12))
@@ -69,88 +57,107 @@ struct ContentView: View {
                         }
                         .buttonStyle(.bordered)
                     }
-                    .padding(.leading, 12)
-                    .padding(.trailing, 12)
+                    .padding(.horizontal, 12)
                 }
                 .padding(.top, 40)
 
-                // 横向分页网格
+                // 横向分页网格 + 页码指示（自适应列/行）
                 VStack(spacing: 12) {
-                    TabView(selection: $currentPage) {
-                        ForEach(pages.indices, id: \.self) { index in
-                            let page = pages[index]
-                            LazyVGrid(columns: gridColumns, spacing: 16) {
-                                ForEach(page) { app in
-                                    AppIconTile(app: app)
-                                }
-                                // 用空白占位填满最后一页，保证左右对齐
-                                if page.count < pageSize {
-                                    ForEach(0..<(pageSize - page.count), id: \.self) { _ in
-                                        Color.clear.frame(width: 0, height: 0)
-                                    }
-                                }
-                            }
-                            .padding(.horizontal, 40)
-                            .padding(.bottom, 8)
-                            .tag(index)
-                        }
-                    }
-#if os(macOS)
-                    .tabViewStyle(DefaultTabViewStyle())
-                    // 捕获两指左右轻扫（macOS）
-                    .background(
-                        SwipeCatcher(
-                            onLeft: { withAnimation(.easeInOut(duration: 0.22)) { currentPage = min(currentPage + 1, max(pages.count - 1, 0)) } },
-                            onRight: { withAnimation(.easeInOut(duration: 0.22)) { currentPage = max(currentPage - 1, 0) } }
-                        ).ignoresSafeArea()
-                    )
-                    // 双指左右滑动或拖拽切页（macOS）
-                    .contentShape(Rectangle())
-                    .highPriorityGesture(
-                        DragGesture(minimumDistance: 15)
-                            .onEnded { value in
-                                let dx = value.translation.width
-                                let dy = value.translation.height
-                                guard abs(dx) > 40, abs(dx) > abs(dy) else { return }
-                                if dx < 0 {
-                                    // 向左滑，下一页
-                                    withAnimation(.easeInOut(duration: 0.22)) {
-                                        currentPage = min(currentPage + 1, max(pages.count - 1, 0))
-                                    }
-                                } else {
-                                    // 向右滑，上一页
-                                    withAnimation(.easeInOut(duration: 0.22)) {
-                                        currentPage = max(currentPage - 1, 0)
-                                    }
-                                }
-                            }
-                    )
-#else
-                    .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
-#endif
-                    .animation(.easeInOut(duration: 0.18), value: pages.count)
+                    GeometryReader { proxy in
+                        // 可用宽高（去除左右内边距）
+                        let availW = max(0, proxy.size.width - horizontalPadding * 2)
+                        // 为圆点等留出空间 40
+                        let availH = max(0, proxy.size.height - 40)
+                        // 单元最小宽高（图标 + 文本 + 内边距）
+                        let minTileW = iconSize + tileHPad * 2
+                        let minTileH = iconSize + tileVPad * 2 + tileSpacingV + titleHeight
+                        // 计算列数与行数（最多 7 列 × 5 行）
+                        let cols = min(7, max(1, Int((availW + gridSpacing) / (minTileW + gridSpacing))))
+                        let rows = min(5, max(1, Int((availH + gridSpacing) / (minTileH + gridSpacing))))
+                        let pageSize = cols * rows
 
-                    // 页码指示器（圆点）
-                    HStack(spacing: 6) {
-                        ForEach(0..<(max(pages.count, 1)), id: \.self) { i in
-                            Circle()
-                                .fill(i == min(currentPage, max(pages.count - 1, 0)) ? Color.primary.opacity(0.8) : Color.primary.opacity(0.25))
-                                .frame(width: 6, height: 6)
+                        // 根据自适应 pageSize 对 filteredApps 分页
+                        let pages: [[AppItem]] = stride(from: 0, to: filteredApps.count, by: max(pageSize,1)).map {
+                            let end = min($0 + max(pageSize,1), filteredApps.count)
+                            return Array(filteredApps[$0..<end])
+                        }
+
+                        // 网格列配置（自适应列数）
+                        let columns = Array(repeating: GridItem(.flexible(), spacing: gridSpacing, alignment: .top), count: max(cols,1))
+
+                        VStack(spacing: 12) {
+                            TabView(selection: $currentPage) {
+                                ForEach(pages.indices, id: \.self) { index in
+                                    let page = pages[index]
+                                    LazyVGrid(columns: columns, spacing: gridSpacing) {
+                                        ForEach(page) { app in
+                                            AppIconTile(app: app)
+                                        }
+                                        // 占位，避免最后一页对不齐
+                                        if page.count < pageSize {
+                                            ForEach(0..<(pageSize - page.count), id: \.self) { _ in
+                                                Color.clear.frame(height: minTileH)
+                                            }
+                                        }
+                                    }
+                                    .padding(.horizontal, horizontalPadding)
+                                    .padding(.bottom, 8)
+                                    .tag(index)
+                                }
+                            }
+#if os(macOS)
+                            .tabViewStyle(DefaultTabViewStyle())
+                            // 捕获两指左右轻扫（macOS）
+                            .background(
+                                SwipeCatcher(
+                                    onLeft: { withAnimation(.easeInOut(duration: 0.22)) { currentPage = min(currentPage + 1, max(pages.count - 1, 0)) } },
+                                    onRight: { withAnimation(.easeInOut(duration: 0.22)) { currentPage = max(currentPage - 1, 0) } }
+                                ).ignoresSafeArea()
+                            )
+                            // 鼠标/触控拖拽切页（备用）
+                            .contentShape(Rectangle())
+                            .highPriorityGesture(
+                                DragGesture(minimumDistance: 15)
+                                    .onEnded { value in
+                                        let dx = value.translation.width
+                                        let dy = value.translation.height
+                                        guard abs(dx) > 40, abs(dx) > abs(dy) else { return }
+                                        if dx < 0 {
+                                            withAnimation(.easeInOut(duration: 0.22)) {
+                                                currentPage = min(currentPage + 1, max(pages.count - 1, 0))
+                                            }
+                                        } else {
+                                            withAnimation(.easeInOut(duration: 0.22)) {
+                                                currentPage = max(currentPage - 1, 0)
+                                            }
+                                        }
+                                    }
+                            )
+#else
+                            .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
+#endif
+                            // 页码指示器
+                            HStack(spacing: 6) {
+                                ForEach(0..<(max(pages.count, 1)), id: \.self) { i in
+                                    Circle()
+                                        .fill(i == min(currentPage, max(pages.count - 1, 0)) ? Color.primary.opacity(0.8) : Color.primary.opacity(0.25))
+                                        .frame(width: 6, height: 6)
+                                }
+                            }
+                            .padding(.bottom, 24)
                         }
                     }
-                    .padding(.bottom, 24)
+                    .animation(.easeInOut(duration: 0.18), value: filteredApps)
                 }
             }
             .ignoresSafeArea()
         }
         .onAppear {
             apps = AppScanner.scanAllApps()
-            // 预热图标缓存，减少首次渲染抖动
             IconProvider.preheat(apps: apps, size: 72)
             debouncedKeyword = keyword
         }
         .onChange(of: keyword) { newValue in
-            // 防抖，减少频繁过滤和视图重排
             let latest = newValue
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
                 if latest == keyword {
@@ -159,14 +166,10 @@ struct ContentView: View {
             }
         }
         .onChange(of: apps) { newApps in
-            // 新结果时也做一次预热
             IconProvider.preheat(apps: newApps, size: 72)
         }
         .onChange(of: filteredApps) { _ in
-            // 过滤结果变化时重置或钳制页码
-            let count = pages.count
-            if count == 0 { currentPage = 0 }
-            else { currentPage = min(currentPage, count - 1) }
+            currentPage = 0
         }
     }
 }
@@ -189,12 +192,10 @@ struct AppIconTile: View {
         let iconImage = IconProvider.icon(for: app, size: 72)
 
         Button(action: {
-            // 闪光动画
             withAnimation(.easeOut(duration: 0.08)) { flashOpacity = 0.18 }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
                 withAnimation(.easeOut(duration: 0.16)) { flashOpacity = 0.0 }
             }
-            // 略微延迟启动，保留点击反馈的观感
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 NSWorkspace.shared.open(URL(fileURLWithPath: app.path))
             }
@@ -209,7 +210,6 @@ struct AppIconTile: View {
                         .cornerRadius(16)
                         .shadow(color: .black.opacity(0.18), radius: 2, x: 0, y: 1)
                         .overlay(
-                            // 快速白色闪光叠加
                             RoundedRectangle(cornerRadius: 16)
                                 .fill(Color.white.opacity(flashOpacity))
                         )

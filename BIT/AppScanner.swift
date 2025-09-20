@@ -82,8 +82,18 @@ struct IconProvider {
         image.lockFocus()
         NSColor.clear.set()
         NSRect(origin: .zero, size: target).fill()
+        
+        // 使用高质量的图像缩放
+        let context = NSGraphicsContext.current?.cgContext
+        context?.interpolationQuality = .high
+        
         base.draw(in: NSRect(origin: .zero, size: target), from: .zero, operation: .sourceOver, fraction: 1.0)
         image.unlockFocus()
+        
+        // 设置缓存限制，避免内存过度使用
+        cache.countLimit = 200
+        cache.totalCostLimit = 50 * 1024 * 1024 // 50MB
+        
         cache.setObject(image, forKey: key)
         return image
     }
@@ -92,8 +102,35 @@ struct IconProvider {
     static func preheat(apps: [AppItem], size: CGFloat) {
         let appsToHeat = apps
         DispatchQueue.global(qos: .utility).async {
-            for app in appsToHeat {
-                _ = self.icon(for: app, size: size)
+            // 分批预热，避免一次性加载过多
+            let batchSize = 20
+            for i in stride(from: 0, to: appsToHeat.count, by: batchSize) {
+                let endIndex = min(i + batchSize, appsToHeat.count)
+                let batch = Array(appsToHeat[i..<endIndex])
+                
+                for app in batch {
+                    _ = self.icon(for: app, size: size)
+                }
+                
+                // 批次之间稍作停顿，避免阻塞主线程
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+        }
+    }
+    
+    // 清理缓存
+    static func clearCache() {
+        cache.removeAllObjects()
+    }
+    
+    // 预生成常用尺寸的图标
+    static func prepareMultipleSizes(for apps: [AppItem]) {
+        let commonSizes: [CGFloat] = [48, 64, 72, 80]
+        DispatchQueue.global(qos: .utility).async {
+            for size in commonSizes {
+                for app in apps.prefix(50) { // 只为前50个应用预生成
+                    _ = self.icon(for: app, size: size)
+                }
             }
         }
     }
