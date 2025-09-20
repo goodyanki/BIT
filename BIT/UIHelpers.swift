@@ -34,112 +34,45 @@ struct WindowConfigurator: View {
     }
 }
 
-// --- 桌面壁纸读取 ---
-func currentDesktopWallpaper() -> NSImage? {
-    guard let screen = NSScreen.main else { return nil }
-    guard let url = NSWorkspace.shared.desktopImageURL(for: screen) else { return nil }
-    guard let img = NSImage(contentsOf: url) else { return nil }
-    return img
+// 纯色背景组件
+struct SolidBackground: View {
+    var color: Color = Color(NSColor.windowBackgroundColor)
+    var body: some View { color.ignoresSafeArea() }
 }
 
-// 返回当前主屏幕的壁纸文件 URL
-func currentDesktopWallpaperURL() -> URL? {
-    guard let screen = NSScreen.main else { return nil }
-    return NSWorkspace.shared.desktopImageURL(for: screen)
-}
+// 在整个视图层接收两指左右“轻扫”事件（macOS：NSEvent.type == .swipe）
+#if os(macOS)
+struct SwipeCatcher: NSViewRepresentable {
+    var onLeft: () -> Void
+    var onRight: () -> Void
 
-// --- 背景：桌面图片 + 模糊 + 轻微压暗 ---
-struct WallpaperBackground: View {
-    @State private var image: NSImage? = currentDesktopWallpaper()
-
-    var body: some View {
-        Group {
-            if let img = image {
-                Image(nsImage: img)
-                    .resizable()
-                    .scaledToFill()
-                    .ignoresSafeArea()
-            } else {
-                // 沙盒或时序原因获取失败时，退化为系统采样，避免黑屏
-                VisualEffectView(material: .hudWindow, blending: .behindWindow)
-                    .ignoresSafeArea()
-            }
-        }
-        // 首次出现时刷新一次（进入全屏后可能需要一点时间）
-        .onAppear {
-            image = currentDesktopWallpaper()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                image = currentDesktopWallpaper()
-            }
-        }
-        // 监听工作区切换
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.activeSpaceDidChangeNotification)) { _ in
-            image = currentDesktopWallpaper()
-        }
-        // 监听壁纸变更（使用分布式通知 com.apple.desktop.changed）
-        .onReceive(DistributedNotificationCenter.default().publisher(for: Notification.Name("com.apple.desktop.changed"))) { _ in
-            image = currentDesktopWallpaper()
-        }
-        // 屏幕参数变化（外接/分辨率变化）
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
-            image = currentDesktopWallpaper()
-        }
-    }
-}
-
-// --- 毛玻璃层（采样窗口后景） ---
-struct VisualEffectView: NSViewRepresentable {
-    var material: NSVisualEffectView.Material = .hudWindow
-    var blending: NSVisualEffectView.BlendingMode = .withinWindow
-
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let v = NSVisualEffectView()
-        v.material = material
-        v.blendingMode = blending
-        v.state = .active
-        v.isEmphasized = true
+    func makeNSView(context: Context) -> SwipeView {
+        let v = SwipeView()
+        v.onLeft = onLeft
+        v.onRight = onRight
         return v
     }
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
-        nsView.material = material
-        nsView.blendingMode = blending
+    func updateNSView(_ nsView: SwipeView, context: Context) {
+        nsView.onLeft = onLeft
+        nsView.onRight = onRight
     }
-}
 
-// --- 手动毛玻璃：使用壁纸图像进行模糊与着色 ---
-struct ManualFrostedPanel: View {
-    var cornerRadius: CGFloat = 16
-    var blurRadius: CGFloat = 20
-    var tintColor: Color = Color.white.opacity(0.25) // 轻微泛白以模拟毛玻璃
+    final class SwipeView: NSView {
+        var onLeft: () -> Void = {}
+        var onRight: () -> Void = {}
 
-    @State private var image: NSImage? = currentDesktopWallpaper()
-
-    var body: some View {
-        ZStack {
-            if let img = image {
-                Image(nsImage: img)
-                    .resizable()
-                    .scaledToFill()
-                    .blur(radius: blurRadius)
-                    .saturation(1.6)
-                    .overlay(tintColor)
-            } else {
-                // 获取不到壁纸时退化为系统毛玻璃，避免纯黑
-                VisualEffectView(material: .hudWindow, blending: .behindWindow)
-            }
+        override var acceptsFirstResponder: Bool { true }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            window?.acceptsMouseMovedEvents = true
         }
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
-        .onAppear {
-            image = currentDesktopWallpaper()
-        }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.activeSpaceDidChangeNotification)) { _ in
-            image = currentDesktopWallpaper()
-        }
-        .onReceive(DistributedNotificationCenter.default().publisher(for: Notification.Name("com.apple.desktop.changed"))) { _ in
-            image = currentDesktopWallpaper()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
-            image = currentDesktopWallpaper()
+        // 两指左右轻扫事件
+        override func swipe(with event: NSEvent) {
+            // deltaX < 0 表示向左轻扫；> 0 表示向右
+            if event.deltaX < 0 { onLeft() }
+            else if event.deltaX > 0 { onRight() }
         }
     }
 }
+#endif
+    
